@@ -23,12 +23,13 @@ python3 -m unittest discover -s tests -v
 - 规模：1 MB 的 JSON、10 万元素数组，求值时间与节点数、结果数成正比，不许 deepcopy 整份文档。
 - 对照自证：与「手写递归遍历」的参考实现比对随机 200 组文档与查询，差异必须为 0。
 
-## 现在的行为
+## 实现说明
 
-- `descend` token 只看当前节点和它的直接子节点：`$..price` 在嵌套两层以上时漏结果。
-- `evaluate` 最后 `sorted(..., key=json.dumps)`：文档顺序全丢，`$.items[*].id` 给 `["a","b"]`。
-- `wildcard` token 只认列表，对象给空。
-- `filter` token 只认 `@.字段`，`@.n > 1` 直接抛 `JsonPathError`。
+- `descend` 先序走到任意深度：子节点按插入序处理，先判当前子节点是否命中，再递归进它的子节点。
+- `evaluate` 不再排序，结果严格按文档顺序，允许重复。
+- `wildcard` 对列表给全部元素，对对象按插入序给全部值。
+- `filter` 支持 `@.字段` 的存在性以及与数字/字符串字面量的 `>`、`<`、`==`、`!=`；
+  字段缺失或类型不匹配判为 false，语法不认识抛带列号的 `JsonPathError`。
 
 ## 计划新增的能力
 

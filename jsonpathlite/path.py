@@ -1,20 +1,27 @@
-"""JSONPath 子集求值。只用标准库。缺陷：递归下降只走一层、结果被重排、过滤器只判存在。"""
+"""JSONPath 子集求值。只用标准库。
 
-import json
+支持：$、.name、['name']、[0]、[*]、..name、[?(...)]。
+结果按文档顺序给出，允许重复，不去重；求值不修改文档。
+"""
+
+import re
 
 
 class JsonPathError(ValueError):
-    """查询语法不合法。缺陷：不带列号。"""
+    """查询语法不合法，带列号（1 起）。"""
 
-    def __init__(self, message):
+    def __init__(self, message, column=None):
+        self.column = column
+        if column is not None:
+            message = "%s（第 %d 列）" % (message, column)
         super().__init__(message)
         self.message = message
 
 
 def tokenize(query):
-    """把查询拆成 token。缺陷：出错不给列号。"""
+    """把查询拆成 token，语法错误抛出带列号的 JsonPathError。"""
     if not query.startswith("$"):
-        raise JsonPathError("查询必须以 $ 开头：%s" % query)
+        raise JsonPathError("查询必须以 $ 开头", 1)
     tokens = []
     index = 1
     while index < len(query):
@@ -24,7 +31,7 @@ def tokenize(query):
             while index < len(query) and (query[index].isalnum() or query[index] == "_"):
                 index += 1
             if start == index:
-                raise JsonPathError(".. 后面缺少字段名")
+                raise JsonPathError(".. 后面缺少字段名", index + 1)
             tokens.append(("descend", query[start:index]))
         elif query[index] == ".":
             index += 1
@@ -32,29 +39,52 @@ def tokenize(query):
             while index < len(query) and (query[index].isalnum() or query[index] == "_"):
                 index += 1
             if start == index:
-                raise JsonPathError(". 后面缺少字段名")
+                raise JsonPathError(". 后面缺少字段名", index + 1)
             tokens.append(("key", query[start:index]))
         elif query[index] == "[":
             end = query.find("]", index)
             if end < 0:
-                raise JsonPathError("方括号没有闭合")
-            tokens.append(_bracket_token(query[index + 1:end].strip()))
+                raise JsonPathError("方括号没有闭合", index + 1)
+            tokens.append(_bracket_token(query[index + 1:end].strip(), index + 1))
             index = end + 1
         else:
-            raise JsonPathError("看不懂的字符：%r" % query[index])
+            raise JsonPathError("看不懂的字符：%r" % query[index], index + 1)
     return tokens
 
 
-def _bracket_token(inner):
+_FILTER_RE = re.compile(r"^@\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:(==|!=|>|<)\s*(.+?)\s*)?$")
+
+
+def _parse_filter(expr, column):
+    match = _FILTER_RE.match(expr)
+    if not match:
+        raise JsonPathError("过滤器语法看不懂：%s" % expr, column)
+    field, op, raw = match.groups()
+    if op is None:
+        return ("filter", field, None, None)
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        literal = raw[1:-1]
+    else:
+        try:
+            literal = int(raw)
+        except ValueError:
+            try:
+                literal = float(raw)
+            except ValueError:
+                raise JsonPathError("过滤器字面量只支持数字或字符串：%s" % raw, column)
+    return ("filter", field, op, literal)
+
+
+def _bracket_token(inner, column):
     if inner == "*":
         return ("wildcard",)
     if inner.startswith("?(") and inner.endswith(")"):
-        return ("filter", inner[2:-1].strip())
+        return _parse_filter(inner[2:-1].strip(), column)
     if len(inner) >= 2 and inner.startswith("'") and inner.endswith("'"):
         return ("key", inner[1:-1])
     if inner and inner.lstrip("-").isdigit():
         return ("index", int(inner))
-    raise JsonPathError("方括号内容看不懂：%s" % inner)
+    raise JsonPathError("方括号内容看不懂：%s" % inner, column)
 
 
 def _children(node):
@@ -63,6 +93,43 @@ def _children(node):
     if isinstance(node, list):
         return list(node)
     return []
+
+
+def _descend(node, name):
+    """先序递归下降：子节点按键的插入序处理，先判当前子节点是否命中，再进它的子节点。"""
+    hits = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == name:
+                hits.append(value)
+            hits.extend(_descend(value, name))
+    elif isinstance(node, list):
+        for item in node:
+            hits.extend(_descend(item, name))
+    return hits
+
+
+def _filter_match(item, field, op, literal):
+    if not isinstance(item, dict) or field not in item:
+        return False
+    if op is None:
+        return True
+    value = item[field]
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)) and isinstance(literal, (int, float)):
+        pass
+    elif isinstance(value, str) and isinstance(literal, str):
+        pass
+    else:
+        return False
+    if op == ">":
+        return value > literal
+    if op == "<":
+        return value < literal
+    if op == "==":
+        return value == literal
+    return value != literal
 
 
 def _apply(node, token):
@@ -77,31 +144,25 @@ def _apply(node, token):
             return [node[position]]
         return []
     if kind == "wildcard":
-        # 缺陷：只认列表，对象直接被跳过
-        return list(node) if isinstance(node, list) else []
+        if isinstance(node, dict):
+            return list(node.values())
+        if isinstance(node, list):
+            return list(node)
+        return []
     if kind == "descend":
-        # 缺陷：只在当前节点和它的直接子节点里找，不再往下递归
-        hits = []
-        if isinstance(node, dict) and token[1] in node:
-            hits.append(node[token[1]])
-        for child in _children(node):
-            if isinstance(child, dict) and token[1] in child:
-                hits.append(child[token[1]])
-        return hits
+        return _descend(node, token[1])
     if kind == "filter":
-        field, _, rest = token[1].partition(".")
-        if field != "@" or not rest.isidentifier():
-            raise JsonPathError("过滤器只支持 @.字段 的存在性判断")
-        return [item for item in _children(node) if isinstance(item, dict) and rest in item]
+        _, field, op, literal = token
+        return [item for item in _children(node) if _filter_match(item, field, op, literal)]
     raise JsonPathError("未知 token：%r" % (token,))
 
 
 def evaluate(document, query):
-    """缺陷：结果按 JSON 文本排序，文档顺序全丢了。"""
+    """按文档顺序求值，不排序、不去重、不修改文档。"""
     current = [document]
     for token in tokenize(query):
         nxt = []
         for node in current:
             nxt.extend(_apply(node, token))
         current = nxt
-    return sorted(current, key=lambda item: json.dumps(item, sort_keys=True))
+    return current
